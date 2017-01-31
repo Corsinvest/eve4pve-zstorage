@@ -1,0 +1,9 @@
+Package: @@PACKAGE@@
+Section: Proxmox
+Version: @@VERSION@@
+Priority: optional
+Architecture: all
+Homepage: http://www.enterpriseve.com/
+Maintainer: EnterpriseVE Support Team <support@enterpriseve.com>
+Description: EnterpriseVE zstorage management library 
+ This package contains the EnterpriseVE zstorage Tool for Proxmox VE.

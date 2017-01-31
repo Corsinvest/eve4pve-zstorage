@@ -1,0 +1,438 @@
+#!/bin/bash
+
+# EnterpriseVE ZFS Sync storage to Host for Proxmox VE.
+# Author: Daniele Corsini <daniele.corsini@enterpriseve.com>
+
+declare -r VERSION=0.1.0
+declare -r NAME=$(basename "$0")
+declare -r PROGNAME=${NAME%.*}
+
+declare -r QEMU_CMD='qm'
+declare -r LXC_CMD='pct'
+
+declare -r PVE_DIR="/etc/pve"
+declare -r PVE_FIREWALL="$PVE_DIR/firewall"
+declare -r QEMU_CONF="$PVE_DIR/qemu-server"
+declare -r LXC_CONF="$PVE_DIR/lxc"
+
+declare -r EXT_CONF='.conf'
+declare -r EXT_FIREWALL='.fw'
+
+declare -i opt_verbose=0
+declare -i opt_debug=0
+declare -i opt_dry_run=0
+declare -i opt_syslog=0
+declare opt_storage=''
+declare opt_host=''
+
+declare local_pool_name=''
+declare remote_pool_name=''
+declare ssh_cmd=''
+declare snap_name_prefix=''
+
+function usage(){
+   shift
+
+    if [ "$1" != "--no-logo" ]; then
+        cat << EOF
+    ______      __                       _              _    ________
+   / ____/___  / /____  _________  _____(_)_______     | |  / / ____/
+  / __/ / __ \/ __/ _ \/ ___/ __ \/ ___/ / ___/ _ \    | | / / __/
+ / /___/ / / / /_/  __/ /  / /_/ / /  / (__  )  __/    | |/ / /___
+/_____/_/ /_/\__/\___/_/  / .___/_/  /_/____/\___/     |___/_____/
+                         /_/
+
+EOF
+    fi
+
+    cat << EOF
+EnterpriseVE ZFS Sync storage to Host for Proxmox VE   (Made in Italy)
+
+Usage:
+    $PROGNAME <COMMAND> [ARGS] [OPTIONS]
+    $PROGNAME help
+    $PROGNAME version
+ 
+    $PROGNAME create  --storage=<string> --host=<string> --syslog 
+    $PROGNAME destroy --storage=<string> --host=<string> 
+    $PROGNAME enable  --storage=<string> --host=<string> 
+    $PROGNAME disable --storage=<string> --host=<string> 
+
+    $PROGNAME status  --storage=<string> --host=<string> 
+    
+    $PROGNAME sync    --storage=<string> --host=<string> --syslog 
+
+Commands:
+    version                  Show version program.
+    help                     Show help program.
+    create                   Create sync job from scheduler.
+    destroy                  Remove sync job from scheduler.
+    enable                   Enable sync job from scheduler.
+    disable                  Disable sync job from scheduler.
+    status                   Get list of all sync.
+    sync                     Will sync one time.
+
+Options:
+    --storage=string         Storage Proxmox VE type ZFS.
+    --host=string            Destination ip addres host Proxmox VE (es 192.168.0.1).
+    --syslog                 Write messages into the system log.
+
+Report bugs to <support@enterpriseve.com>. 
+EOF
+
+    exit 1
+}
+
+function log(){
+    local level=$1
+    shift 1
+    local message=$*
+
+    case $level in
+        debug) [ $opt_debug -eq 1 ] && echo -e "$(date "+%F %T") DEBUG: $message";;
+        
+        info) 
+            echo -e "$message"; 
+            [ $opt_syslog -eq 1 ] && logger -t "$PROGNAME" "$message"
+            ;;
+        
+        error)
+            echo "ERROR: $message" 1>&2
+            [ $opt_syslog -eq 1 ] && logger -t "$PROGNAME" -p daemon.err "$message"
+            ;;
+
+        *)  
+            echo "$message" 1>&2
+            [ $opt_syslog -eq 1 ] && logger -t "$PROGNAME" "$message"
+            ;;
+    esac
+}
+
+function get_pool_name(){
+    local cmd=''
+    local msg=''
+    local type='Local'
+    if [ "$1" -eq 1 ]; then
+        cmd=$ssh_cmd
+        msg="in host '$opt_host' "
+        type='Remote'
+    fi
+
+    local pool_name
+    pool_name=$($cmd cat /etc/pve/storage.cfg | \
+                grep -A1 "zfspool: $opt_storage" | \
+                grep 'pool ' | \
+                xargs | awk '{ split($0,a," "); print a[2]}')
+
+    [ -z "$pool_name" ] && { log info "Storage $opt_storage $msg not found."; exit 1; }
+
+    [ -z "$($cmd zfs list -H -o name "$pool_name" 2>/dev/null)" ] \
+        && { log info "$type '$pool_name' is not ZFS poll."; exit 1; }
+
+    if [ "$1" -eq 0 ]; then
+        local_pool_name=$pool_name
+    else
+        remote_pool_name=$pool_name
+    fi
+}
+
+function parse_opts(){
+    local action=$1
+    shift
+
+    local args; 
+    args=$(getopt \
+           --options '' \
+           --longoptions=storage:,host: \
+           --longoptions=syslog,debug,dry-run,verbose \
+           --name "$PROGNAME" \
+           -- "$@") \
+           || exit 128
+
+    eval set -- "$args"
+
+    while true; do    
+      case "$1" in
+        --storage) opt_storage="$2"; shift 2;;
+        --host) opt_host="$2"; shift 2;;
+        --syslog) opt_syslog=1; shift;;
+        --debug) opt_debug=1; shift;;
+        --dry-run) opt_dry_run=1; shift;;
+        --verbose) opt_verbose=1; shift;;        
+        --) shift; break;;
+        *) break;;
+      esac
+    done
+
+    [ -z "$opt_storage" ] && { log info "Storage is not set correctly."; exit 1; }
+
+    #local pool name from storage name
+    get_pool_name 0
+
+    [ -z "$opt_host" ] && { log info "Host is not set correctly"; exit 1; }
+    [[ ! $opt_host =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] \
+        && { log info "Remote ip address is not set correctly."; exit 1; }
+
+    #save key ssh 
+    do_run "ssh-copy-id -i /root/.ssh/id_rsa.pub root@$opt_host > /dev/null 2>&1"
+
+    ssh_cmd="ssh -o BatchMode=yes root@$opt_host"
+
+    #remote pool name from storage name
+    get_pool_name 1
+    
+    snap_name_prefix="zstorage$opt_host"
+}
+
+function cron_action_job(){
+    local action=$1
+    parse_opts "$@"
+
+    local -r cron_file="/etc/cron.d/$PROGNAME"    
+    local -r job_key_cron="sync --storage='$opt_storage' --host='$opt_host'"    
+
+    #create cron file if not exist
+    if [ ! -e "$cron_file" ]; then
+        cat > "$cron_file" << EOL
+#Cron file for $PROGNAME automatically generated
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+EOL
+    fi    
+
+    local -i check=0; [ "$action" = "create" ] && check=1 
+    if grep -h "$job_key_cron" "$cron_file"; then
+        [ $check -eq 1 ] && { log info "Job already exists in cron file '$cron_file'"; exit 1; }
+    else
+        [ $check -eq 0 ] && { log info "Job not exists in cron file '$cron_file'"; exit 1; }
+    fi
+
+    #action
+    case $action in
+        create)
+            local job="0 0 * * * root $PROGNAME $job_key_cron"
+            [ $opt_syslog -eq 1 ] && job="$job --syslog"
+        
+            echo -e "$job" >> "$cron_file"
+            ;;
+
+        destroy) sed -i "\?$job_key_cron?d" "$cron_file";;
+        enable) sed -i "\?$job_key_cron?s?^#??g" "$cron_file";;
+        disable) sed -i "\?$job_key_cron?s?^?#?g" "$cron_file";;
+    esac
+
+    echo -e "Job $action in cron file '$cron_file'";
+}
+
+function do_run(){
+    local cmd=$*;
+    local -i rc=0;
+
+    if [ $opt_dry_run -eq 1 ]; then
+        echo "$cmd"
+        rc=$?
+    else
+        log debug "$cmd"
+        eval "$cmd"
+        rc=$?
+        [ $rc != 0 ] && log error "$cmd"
+        log debug "return $rc"
+    fi
+
+    return $rc
+}
+
+function sync(){
+    parse_opts "$@"
+
+    local local_latest_snap; local_latest_snap=$(get_latest_snap 0)
+    local remote_latest_snap; remote_latest_snap=$(get_latest_snap 1)
+
+    if [ "${local_latest_snap#*@}" != "${remote_latest_snap#*@}" ]; then
+        log info "Local snapshot '$local_latest_snap' and remote snapshot '$remote_latest_snap' not match!"
+        exit 1
+    fi
+
+    local -i sync_pool=0
+    local storage_vms=()
+    local -i index;
+
+    for index in $(seq 0 1);do
+        [ "$index" -eq 1 ] && cmd=$ssh_cmd
+
+        #check esisting VM/CT in pool anc copy config
+        local tecnology
+        for tecnology in $QEMU_CMD $LXC_CMD; do
+            local -i vm_id
+            for vm_id in $($cmd $tecnology list | awk '{print $1}' | sed 1d) ; do
+                #disks available
+                local disks; 
+                disks=$($cmd $tecnology config "$vm_id" | \
+                        grep -P '^(?:((?:virtio|ide|scsi|sata|mp)\d+)|rootfs): ' | \
+                        grep -v -P 'cdrom|none' | \
+                        awk '{ split($0,a,","); split(a[1],b," "); print b[2]}')
+
+                #decode disk
+                local disk='' 
+                for disk in $disks; do
+                    local storage_id; 
+
+                    storage_id=$(echo "$disk" | \
+                                 awk '{ sub("file=",""); print}' | \
+                                 awk '{ split($0,a,":"); print a[1]}')
+                     
+                    if [ "$storage_id" = "$opt_storage" ]; then
+                        #get path config
+                        local path_config=
+                        case $tecnology in
+                            $QEMU_CMD) path_config=$QEMU_CONF;; 
+                            $LXC_CMD) path_config=$LXC_CONF;;
+                        esac
+
+                        if [ "$index" -eq 1 ]; then
+                            #remove vm in remote
+                            local -i remote_found=0
+                            local -i storage_vm_id=0
+                            for storage_vm_id in ${storage_vms[*]};do
+                                if [ "$storage_vm_id" -eq "$vm_id" ]; then
+                                    remote_found=1
+                                    break
+                                fi
+                            done
+
+                            #check esiste vm 
+                            if [ $remote_found -eq 0 ]; then
+                                #delete config files
+                                log info "VM $vm_id - remove"
+                                do_run "$ssh_cmd '$tecnology destroy $vm_id'"
+
+                                #delete firewall files
+                                do_run "$ssh_cmd 'rm -f $PVE_FIREWALL/$vm_id$EXT_FIREWALL'"
+                            fi
+
+                        else
+                            log info "VM $vm_id - Found in poll '$local_pool_name'"
+
+                            sync_pool=1
+
+                            #copy config files
+                            log info "VM $vm_id - Copy config"
+                            do_run "scp -q $path_config/$vm_id$EXT_CONF root@$opt_host:$path_config/$vm_id$EXT_CONF"
+
+                            #copy firewall files
+                            #create folder and remove if exists in remote
+                            do_run "$ssh_cmd 'mkdir -p $PVE_FIREWALL; rm -f $PVE_FIREWALL/$vm_id$EXT_FIREWALL'"
+                            if [ -e "$PVE_FIREWALL/$vm_id$EXT_FIREWALL" ]; then
+                                log info "VM $vm_id - Copy firewall"
+                                do_run "scp -q $PVE_FIREWALL/$vm_id$EXT_FIREWALL root@$opt_host:$PVE_FIREWALL/$vm_id$EXT_FIREWALL"                
+                            fi
+
+                            #disable auto boot
+                            log info "VM $vm_id - Disable auto boot"
+                            do_run "$ssh_cmd $tecnology set $vm_id --onboot 0" #> /dev/null 2>&1
+                            
+                            storage_vms+=($vm_id)
+                        fi
+
+                        break;
+                    fi
+                done
+            done
+        done
+    done
+
+    [ $sync_pool -eq 0 ] && { log info "No VM/CT not found in storage $opt_storage !"; exit 1; }
+
+    local snap_name; snap_name="$snap_name_prefix-$(date +%y-%m-%d_%H:%M:%S)"
+    local local_snap="$local_pool_name@$snap_name"
+    local remote_snap="$remote_pool_name@$snap_name"
+
+    #create recursive snapshot of the whole pool.
+    log info "Creating local snapshot $local_snap"
+    do_run "zfs snapshot -r $local_snap"
+
+    local cmd="zfs send -R"
+
+    #check for incremental
+    [ -n "$local_latest_snap" ] && cmd="$cmd -I $local_latest_snap"
+    
+    #verbose
+    [ $opt_verbose -eq 1 ] && cmd="$cmd -v"
+
+    cmd="$cmd $local_snap | $ssh_cmd zfs recv -F $remote_pool_name" 
+
+    log info "Send snapshot $local_snap to remote host"
+    if ! do_run "$cmd"; then
+        snapshot_remove 0 "$local_snap"
+        snapshot_remove 1 "$remote_snap"
+        exit 1;
+    fi
+        
+    #delete older snaps 
+    [ -n "$local_latest_snap" ] && snapshot_remove 0 "$local_latest_snap"
+    [ -n "$remote_latest_snap" ] && snapshot_remove 1 "$remote_latest_snap"
+}
+
+function snapshot_remove(){
+    local cmd=''
+    local msg='local'
+    if [ "$1" -eq 1 ]; then
+        cmd=$ssh_cmd
+        msg='remote'
+    fi
+
+    log info "Remove $msg snapshot $2"
+    do_run "$cmd zfs destroy -r $2"    
+}
+
+function get_latest_snap(){
+    local cmd=''
+    local pool_name=$local_pool_name
+    if [ "$1" -eq 1 ]; then
+        cmd=$ssh_cmd
+        pool_name=$remote_pool_name
+    fi
+
+    local snap
+    snap=$($cmd zfs list -H -o name -t snapshot -r "$pool_name" | \
+           grep "$pool_name@$snap_name_prefix" | \
+           sort -r | \
+           head -n 1)
+    
+    echo "$snap"
+}
+
+function status(){
+    parse_opts "$@"
+
+    echo "PVE Storage             | $opt_storage"
+
+    local -i type=0
+    for type in $(seq 0 1); do
+        local dest='Local ' 
+        [ "$type" -eq 1 ] && dest='Remote'
+
+        local latest_snap; latest_snap=$(get_latest_snap "$type")
+    
+        echo "$dest ZFS pool name    | ${latest_snap%@*}"
+        echo "$dest ZFS pool update  | ${latest_snap#*@}"
+    done    
+}
+
+function main(){    
+    [ $# = 0 ] && usage;
+
+    case "$1" in
+        version) echo "$VERSION";;
+        help) usage "$@";;
+        sync) sync "$@";; 
+        status) status "$@";; 
+        create|destroy|enable|disable) cron_action_job "$@";;
+        *) usage;;
+    esac
+
+    exit 0;
+}
+
+main "$@"
